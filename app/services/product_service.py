@@ -1,43 +1,87 @@
-from typing import List, Optional
-from app.repositories.product_repo import ProductRepository, product_repo
-from app.schemas import ProductCreate, ProductUpdate, ProductResponse
+﻿from decimal import Decimal, ROUND_HALF_UP
+from app.errors import NotFoundError, ValidationError
+
+ALLOWED_FIELDS = ("name", "price", "stock", "discountPercent")
+
+def _is_number(value) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value == value
+    )
+
+def calculate_final_price(price, discount_percent=0):
+    value = Decimal(str(price)) * (100 - Decimal(str(discount_percent))) / 100
+    value = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return int(value) if value == value.to_integral_value() else float(value)
+
+def validate_product(data: dict, partial: bool = False) -> list[str]:
+    errors = []
+    if not partial or "name" in data:
+        name = data.get("name")
+        if not isinstance(name, str) or not name.strip():
+            errors.append("name is required")
+        elif len(name) > 100:
+            errors.append("name must be at most 100 characters")
+
+    if not partial or "price" in data:
+        price = data.get("price")
+        if not _is_number(price) or price <= 0:
+            errors.append("price must be a number greater than 0")
+
+    if not partial or "stock" in data:
+        stock = data.get("stock")
+        if not isinstance(stock, int) or isinstance(stock, bool) or stock < 0:
+            errors.append("stock must be an integer >= 0")
+
+    if "discountPercent" in data:
+        discount = data["discountPercent"]
+        if not _is_number(discount) or discount < 0 or discount > 100:
+            errors.append("discountPercent must be between 0 and 100")
+
+    return errors
 
 class ProductService:
-    def __init__(self, repo: ProductRepository = product_repo):
-        self.repo = repo
+    def __init__(self, repository):
+        self.repository = repository
 
-    def create_product(self, product: ProductCreate) -> ProductResponse:
-        return self.repo.create(product)
+    @staticmethod
+    def _to_product(record: dict) -> dict:
+        discount = record.get("discountPercent", 0)
+        final_price = calculate_final_price(record["price"], discount)
+        return {**record, "finalPrice": final_price}
 
-    def get_product(self, product_id: int) -> Optional[ProductResponse]:
-        return self.repo.get_by_id(product_id)
+    def list_products(self) -> list[dict]:
+        return [self._to_product(r) for r in self.repository.find_all()]
 
-    def get_all_products(
-        self,
-        category: Optional[str] = None,
-        min_price: Optional[float] = None,
-        max_price: Optional[float] = None,
-    ) -> List[ProductResponse]:
-        return self.repo.get_all(category, min_price, max_price)
+    def get_product(self, product_id: int) -> dict:
+        record = self.repository.find_by_id(product_id)
+        if record is None:
+            raise NotFoundError(f"Product {product_id} not found")
+        return self._to_product(record)
 
-    def update_product(self, product_id: int, product: ProductUpdate) -> Optional[ProductResponse]:
-        return self.repo.update(product_id, product)
+    def create_product(self, data: dict) -> dict:
+        errors = validate_product(data)
+        if errors:
+            raise ValidationError(errors)
+        record = self.repository.create({
+            "name": data["name"].strip(),
+            "price": data["price"],
+            "stock": data["stock"],
+            "discountPercent": data.get("discountPercent", 0),
+        })
+        return self._to_product(record)
 
-    def delete_product(self, product_id: int) -> bool:
-        return self.repo.delete(product_id)
+    def update_product(self, product_id: int, data: dict) -> dict:
+        errors = validate_product(data, partial=True)
+        if errors:
+            raise ValidationError(errors)
+        changes = {k: v for k, v in data.items() if k in ALLOWED_FIELDS}
+        record = self.repository.update(product_id, changes)
+        if record is None:
+            raise NotFoundError(f"Product {product_id} not found")
+        return self._to_product(record)
 
-    def calculate_discount(self, product_id: int, discount_pct: float) -> Optional[dict]:
-        product = self.repo.get_by_id(product_id)
-        if not product:
-            return None
-        discount_amount = round(product.price * (discount_pct / 100), 2)
-        final_price = round(product.price - discount_amount, 2)
-        return {
-            "product_id": product.id,
-            "original_price": product.price,
-            "discount_pct": discount_pct,
-            "discount_amount": discount_amount,
-            "final_price": final_price,
-        }
-
-product_service = ProductService()
+    def delete_product(self, product_id: int) -> None:
+        if not self.repository.remove(product_id):
+            raise NotFoundError(f"Product {product_id} not found")
